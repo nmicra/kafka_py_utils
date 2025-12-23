@@ -1,0 +1,108 @@
+#!/usr/bin/env python3
+import argparse
+import sys
+from kafka import KafkaConsumer, KafkaProducer, TopicPartition
+from kafka.errors import KafkaError
+
+
+def main():
+    parser = argparse.ArgumentParser(
+        description="Read the latest N messages from a source Kafka topic and relay them to a destination topic."
+    )
+    parser.add_argument("--src-bootstrap", required=True,
+                        help="Source bootstrap servers, e.g. host1:9092 or host1:9092,host2:9092")
+    parser.add_argument("--src-topic", required=True, help="Source topic name")
+    parser.add_argument("--dst-bootstrap", required=True,
+                        help="Destination bootstrap servers, comma-separated")
+    parser.add_argument("--dst-topic", required=True, help="Destination topic name")
+    parser.add_argument("--n", type=int, required=True,
+                        help="Number of latest messages to relay (approximate across all partitions)")
+    parser.add_argument("--timeout-ms", type=int, default=10000,
+                        help="Consumer timeout in ms (default: 10000)")
+    parser.add_argument("--producer-acks", default="all",
+                        help="Producer acks setting (default: all)")
+
+    args = parser.parse_args()
+
+    # Source consumer - read raw bytes
+    consumer = KafkaConsumer(
+        bootstrap_servers=args.src_bootstrap.split(","),
+        enable_auto_commit=False,
+        auto_offset_reset="earliest",  # Changed to "earliest" for robustness with large N or retention
+        consumer_timeout_ms=args.timeout_ms,
+        # Do NOT deserialize - we want raw bytes
+        key_deserializer=lambda k: k,      # keep as bytes or None
+        value_deserializer=lambda v: v,    # keep as bytes or None
+    )
+
+    # Destination producer
+    producer = KafkaProducer(
+        bootstrap_servers=args.dst_bootstrap.split(","),
+        acks=args.producer_acks,
+        retries=5,
+        # Keep key/value as bytes
+        key_serializer=lambda k: k,
+        value_serializer=lambda v: v,
+    )
+
+    try:
+        # Discover partitions
+        partitions = consumer.partitions_for_topic(args.src_topic)
+        if not partitions:
+            sys.exit(f"Error: Topic '{args.src_topic}' not found or has no partitions.")
+
+        tps = [TopicPartition(args.src_topic, p) for p in sorted(partitions)]
+        consumer.assign(tps)
+
+        # Get end offsets and seek to (end - n) per partition
+        end_offsets = consumer.end_offsets(tps)
+        for tp in tps:
+            end = end_offsets[tp]
+            target_offset = max(0, end - args.n)
+            consumer.seek(tp, target_offset)
+
+        print(f"Starting relay of up to {args.n} latest messages "
+              f"from {args.src_topic} → {args.dst_topic}")
+
+        relayed_count = 0
+
+        for message in consumer:
+            # Forward the message preserving all attributes
+            future = producer.send(
+                topic=args.dst_topic,
+                value=message.value,
+                key=message.key,
+                headers=message.headers,        # preserves headers if any
+                timestamp_ms=message.timestamp,  # preserves original timestamp
+                partition=None                   # let Kafka decide (same as original behavior)
+            )
+
+            try:
+                # Wait for confirmation (with timeout)
+                future.get(timeout=10)
+            except KafkaError as e:
+                print(f"Failed to send message (offset {message.offset}): {e}", file=sys.stderr)
+                # Decide: continue or abort?
+                # Here we continue to try others
+                continue
+
+            relayed_count += 1
+            print(f"Relayed message {relayed_count}: partition={message.partition}, offset={message.offset}")
+
+            if relayed_count >= args.n:
+                break
+
+        print(f"\nFinished. Relayed {relayed_count} messages.")
+
+    except KeyboardInterrupt:
+        print("\nInterrupted by user.")
+    except Exception as e:
+        sys.exit(f"Error: {e}")
+    finally:
+        consumer.close()
+        producer.flush()
+        producer.close()
+
+
+if __name__ == "__main__":
+    main()
